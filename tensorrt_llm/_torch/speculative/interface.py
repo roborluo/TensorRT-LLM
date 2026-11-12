@@ -3266,8 +3266,13 @@ class SpecWorkerBase(nn.Module, ABC):
         else:
             onehot_vocab = spec_metadata.draft_probs_vocab_size
             spec_metadata.draft_probs_last_dim = onehot_vocab
-        spec_metadata.draft_probs[ctx_slot_ids, :draft_len, :onehot_vocab] = 0.0
-        spec_metadata.draft_probs[ctx_slot_ids, :draft_len, 0] = 1.0
+        # index_fill_ takes the scalar as a kernel argument; the old
+        # advanced-index assignment of a Python scalar did a pageable H2D copy
+        # plus cudaStreamSynchronize per call (2 host syncs per prefill step).
+        ctx_slot_ids = ctx_slot_ids.long()
+        dp = spec_metadata.draft_probs
+        dp[:, :draft_len, :onehot_vocab].index_fill_(0, ctx_slot_ids, 0.0)
+        dp[:, :draft_len, 0].index_fill_(0, ctx_slot_ids, 1.0)
 
     def sample_draft_tokens(self,
                             logits,

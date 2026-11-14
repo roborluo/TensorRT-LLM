@@ -53,6 +53,10 @@ _MLA_FP8_DECLARATIONS = _MLA_PROJECTIONS + (
 # Shared experts stay BF16 (the runtime forces it); f_b_proj joins the FP8 attention set.
 _REQUANT_EXCLUDES_DROP = ("*self_attn.f_b_proj*",)
 _REQUANT_EXCLUDES_ADD = ("*block_sparse_moe.shared_experts*", "*mlp.gate*", "*mlp.shared_experts*")
+# KDA projections that run as plain BF16 nn.Linear. An MXFP8 source is decoded directly by the
+# trunk loader instead of taking an extra FP8 128x128 rounding on the way to BF16.
+_KDA_BF16_RUNTIME_PROJECTIONS = ("b_proj", "f_a_proj")
+_REQUANT_ALLOW_CPU = "TLLM_K31_REQUANT_ALLOW_CPU"
 
 
 class _TensorSlice(Protocol):
@@ -95,11 +99,7 @@ def dequantize_mxfp4_weight(packed: torch.Tensor, scales: torch.Tensor) -> torch
     return weight
 
 
-def dequantize_mxfp8_weight(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """Decode E4M3 [N,K] with E8M0 [N,ceil(K/32)] 1x32 block scales into BF16 [N,K].
-
-    Exact: an E4M3 value times a power of two is representable in BF16.
-    """
+def _check_mxfp8(codes: torch.Tensor, scales: torch.Tensor) -> None:
     if codes.dtype != torch.float8_e4m3fn or scales.dtype != torch.uint8:
         raise TypeError("MXFP8 conversion requires E4M3 weights and uint8 E8M0 scales")
     if codes.ndim != 2 or scales.ndim != 2 or codes.numel() == 0:
@@ -113,17 +113,83 @@ def dequantize_mxfp8_weight(codes: torch.Tensor, scales: torch.Tensor) -> torch.
         raise ValueError("MXFP8 weights and scales must be on the same device")
     if (scales == 255).any():
         raise ValueError("MXFP8 E8M0 scales contain NaN (255)")
+
+
+def e8m0_to_float32(scales: torch.Tensor) -> torch.Tensor:
+    """Exact FP32 power of two 2^(s-127) for E8M0 bytes 0..254, built from the bit pattern."""
+    bits = scales.to(torch.int32)
+    # s >= 1 is the normal float 2^(s-127); s == 0 is the subnormal 2^-127.
+    bits = torch.where(bits == 0, torch.full_like(bits, 1 << 22), bits << 23)
+    return bits.view(torch.float32)
+
+
+def dequantize_mxfp8_weight(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Decode E4M3 [N,K] with E8M0 [N,ceil(K/32)] 1x32 block scales into BF16 [N,K].
+
+    The scale is built from its bits and applied as one FP32 multiply by a power of two, so
+    the decode is exact on CPU and CUDA alike (no ldexp/pow). BF16 holds every product exactly
+    unless it falls below the BF16 subnormal range.
+    """
+    _check_mxfp8(codes, scales)
+    rows, cols = codes.shape
     weight = torch.empty((rows, cols), dtype=torch.bfloat16, device=codes.device)
     chunk_rows = max(1, _DEQUANT_MAX_CHUNK_ELEMENTS // cols)
     for start in range(0, rows, chunk_rows):
-        exponents = scales[start : start + chunk_rows].int() - 127
-        exponents = exponents.repeat_interleave(32, dim=1)[:, :cols]
-        decoded = torch.ldexp(codes[start : start + chunk_rows].float(), exponents)
+        factor = e8m0_to_float32(scales[start : start + chunk_rows])
+        factor = factor.repeat_interleave(32, dim=1)[:, :cols]
+        decoded = codes[start : start + chunk_rows].float() * factor
         weight[start : start + chunk_rows].copy_(decoded.bfloat16())
-        del exponents, decoded
+        del factor, decoded
     if not torch.isfinite(weight).all():
         raise ValueError("MXFP8 weights are not representable in BF16")
     return weight
+
+
+def _pow2_float64(exponents: torch.Tensor) -> torch.Tensor:
+    """Exact FP64 2^e for integer e in [-1022, 1023], built from the bit pattern."""
+    bits = (exponents.to(torch.int64) + 1023) << 52
+    return bits.view(torch.float64)
+
+
+def requantize_mxfp8_weight(
+    codes: torch.Tensor, scales: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Re-encode MXFP8 as E4M3 [N,K] with FP32 128x128 power-of-two block scales.
+
+    Each 128x128 block takes the scale 2^(largest E8M0 exponent among its 1x32 groups), so a
+    code moves by an exact power of two (a shift of 0 for the largest group). The re-encode is
+    lossless unless a small group drops below the E4M3 subnormal range, which only happens when
+    groups of one block differ by many octaves; ``mxfp8_requant_loss`` counts such codes.
+    """
+    _check_mxfp8(codes, scales)
+    rows, cols = codes.shape
+    block, groups = 128, 128 // 32
+    nr, nc = math.ceil(rows / block), math.ceil(cols / block)
+    exponents = scales.to(torch.int32) - 127
+    padded = F.pad(
+        exponents, (0, nc * groups - exponents.shape[1], 0, nr * block - rows), value=-127
+    )
+    block_exp = padded.reshape(nr, block, nc, groups).amax(dim=(1, 3))
+    out = torch.empty((rows, cols), dtype=torch.float8_e4m3fn, device=codes.device)
+    chunk_blocks = max(1, _DEQUANT_MAX_CHUNK_ELEMENTS // (block * cols))
+    for b0 in range(0, nr, chunk_blocks):
+        r0, r1 = b0 * block, min(rows, (b0 + chunk_blocks) * block)
+        row_exp = block_exp[b0 : b0 + chunk_blocks].repeat_interleave(block, dim=0)[: r1 - r0]
+        shift = exponents[r0:r1] - row_exp.repeat_interleave(groups, dim=1)[:, : exponents.shape[1]]
+        factor = _pow2_float64(shift).repeat_interleave(32, dim=1)[:, :cols]
+        out[r0:r1].copy_((codes[r0:r1].float().double() * factor).float().to(torch.float8_e4m3fn))
+        del row_exp, shift, factor
+    return out, e8m0_to_float32((block_exp + 127).to(torch.uint8)).contiguous()
+
+
+def mxfp8_requant_loss(
+    codes: torch.Tensor, scales: torch.Tensor, new_codes: torch.Tensor, new_scales: torch.Tensor
+) -> int:
+    """Number of elements whose value changed in ``requantize_mxfp8_weight``."""
+    rows, cols = codes.shape
+    reference = dequantize_mxfp8_weight(codes, scales).float()
+    factor = new_scales.repeat_interleave(128, dim=0)[:rows].repeat_interleave(128, dim=1)
+    return int((new_codes.float() * factor[:, :cols] != reference).sum())
 
 
 def quantize_expert_weight(
@@ -192,8 +258,9 @@ class _AttentionPair:
             if self.mxfp8_scale is not None:
                 scale = self.mxfp8_scale
                 scale = scale if isinstance(scale, torch.Tensor) else scale[:]
-                source = dequantize_mxfp8_weight(source, scale.to(self.device))
-            codes, scales = quantize_attention_weight(source)
+                codes, scales = requantize_mxfp8_weight(source, scale.to(self.device))
+            else:
+                codes, scales = quantize_attention_weight(source)
             self.codes, self.scales = codes.cpu(), scales.cpu()
 
 
@@ -465,19 +532,56 @@ class K31AttentionRequant(K31LoadQuantization):
         adapted = dict(weights.items())
         prefix = "language_model." if any(k.startswith("language_model.") for k in adapted) else ""
         device = next(llm.parameters()).device
-        for name in self.attention_keys:
+        if device.type != "cuda" and os.environ.get(_REQUANT_ALLOW_CPU, "0") != "1":
+            raise RuntimeError(
+                f"{_REQUANT_SWITCH}=1 requantizes on the model device, which is {device}; "
+                f"expected CUDA (set {_REQUANT_ALLOW_CPU}=1 only for CPU tests)"
+            )
+        direct, requant_mx, requant_bf16 = 0, 0, 0
+        for name in sorted(self.attention_keys):
             key = prefix + name
             if key not in adapted:
                 raise KeyError(f"{_REQUANT_SWITCH} is missing attention projection {key}")
             if key + "_scale_inv" in adapted:
                 raise ValueError(f"{_REQUANT_SWITCH} expects MXFP8 or BF16 attention: {key}")
+            projection = name.rsplit(".", 2)[-2]
+            if key + "_scale" in adapted and _is_kda_bf16_runtime(llm, name, projection):
+                # Leave E4M3 + E8M0 in place; the trunk loader decodes MXFP8 to BF16 directly.
+                direct += 1
+                continue
             mxfp8_scale = adapted.pop(key + "_scale", None)
+            if mxfp8_scale is None:
+                requant_bf16 += 1
+            else:
+                requant_mx += 1
             pair = _AttentionPair(adapted[key], device, mxfp8_scale=mxfp8_scale)
             adapted[key] = _AttentionValue(pair)
             adapted[key + "_scale"] = _AttentionValue(pair, scale=True)
+        logger.info(
+            f"{_REQUANT_SWITCH}=1 on {device}: {requant_mx} MXFP8 projections re-encoded with "
+            f"power-of-two 128x128 scales, {requant_bf16} BF16 projections quantized, {direct} "
+            "MXFP8 projections left for direct BF16 decode"
+        )
         result = ConsumableWeightsDict(adapted)
         checkpoint_dir = getattr(weights, "checkpoint_dir", None)
         if checkpoint_dir is not None:
             result.checkpoint_dir = checkpoint_dir
         result.checkpoint_prefix = getattr(weights, "checkpoint_prefix", "")
         return result
+
+
+def _is_kda_bf16_runtime(llm: KimiLinearForCausalLM, name: str, projection: str) -> bool:
+    """True if ``name`` is a KDA projection that the runtime keeps as a plain BF16 nn.Linear."""
+    if projection not in _KDA_BF16_RUNTIME_PROJECTIONS:
+        return False
+    match = re.match(r"model\.layers\.(\d+)\.self_attn\.", name)
+    layers = getattr(getattr(llm, "model", None), "layers", None)
+    if match is None or layers is None:
+        return False
+    layer = layers[int(match.group(1))]
+    if not getattr(layer, "is_kda", False):
+        return False
+    module = getattr(getattr(layer, "linear_attn", None), projection, None)
+    if module is None or getattr(module, "has_fp8_block_scales", False):
+        return False
+    return type(module) is torch.nn.Linear

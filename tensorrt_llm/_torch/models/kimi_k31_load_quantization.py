@@ -3,6 +3,8 @@
 """Opt-in K3.1 checkpoint conversion at load time.
 
 ``TLLM_K31_LOAD_QUANTIZE=1`` selects NVFP4 experts and block-scaled FP8 attention.
+``TLLM_K31_REQUANT_ATTN_FP8=1`` keeps native NVFP4 experts and requantizes MXFP8/BF16
+attention to block-scaled FP8 (see ``K31AttentionRequant``).
 The adapter owns source-format handling; runtime modules use the native loaders.
 """
 
@@ -10,6 +12,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
@@ -38,6 +41,18 @@ _KDA_PROJECTIONS = (
     "b_proj",
 )
 _MLA_PROJECTIONS = ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "g_proj", "o_proj")
+_REQUANT_SWITCH = "TLLM_K31_REQUANT_ATTN_FP8"
+# Per-layer FP8_PB_WO declarations of nvidia/Kimi-K3-NVFP4 (fused aliases included).
+_KDA_FP8_DECLARATIONS = _KDA_PROJECTIONS + ("fused_qkvg_proj", "in_proj_qkvgfab")
+_MLA_FP8_DECLARATIONS = _MLA_PROJECTIONS + (
+    "fused_qkv_a_proj",
+    "fused_qkv_a_proj_with_mqa",
+    "fused_qkvg_proj",
+    "in_proj_qkvgfab",
+)
+# Shared experts stay BF16 (the runtime forces it); f_b_proj joins the FP8 attention set.
+_REQUANT_EXCLUDES_DROP = ("*self_attn.f_b_proj*",)
+_REQUANT_EXCLUDES_ADD = ("*block_sparse_moe.shared_experts*", "*mlp.gate*", "*mlp.shared_experts*")
 
 
 class _TensorSlice(Protocol):
@@ -77,6 +92,37 @@ def dequantize_mxfp4_weight(packed: torch.Tensor, scales: torch.Tensor) -> torch
         del indices, values, decoded
     if not torch.isfinite(weight).all():
         raise ValueError("MXFP4 weights are not representable in BF16")
+    return weight
+
+
+def dequantize_mxfp8_weight(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Decode E4M3 [N,K] with E8M0 [N,ceil(K/32)] 1x32 block scales into BF16 [N,K].
+
+    Exact: an E4M3 value times a power of two is representable in BF16.
+    """
+    if codes.dtype != torch.float8_e4m3fn or scales.dtype != torch.uint8:
+        raise TypeError("MXFP8 conversion requires E4M3 weights and uint8 E8M0 scales")
+    if codes.ndim != 2 or scales.ndim != 2 or codes.numel() == 0:
+        raise ValueError("MXFP8 conversion requires a non-empty matrix")
+    rows, cols = codes.shape
+    if tuple(scales.shape) != (rows, math.ceil(cols / 32)):
+        raise ValueError(
+            f"MXFP8 scale shape {tuple(scales.shape)} does not cover weight {tuple(codes.shape)}"
+        )
+    if codes.device != scales.device:
+        raise ValueError("MXFP8 weights and scales must be on the same device")
+    if (scales == 255).any():
+        raise ValueError("MXFP8 E8M0 scales contain NaN (255)")
+    weight = torch.empty((rows, cols), dtype=torch.bfloat16, device=codes.device)
+    chunk_rows = max(1, _DEQUANT_MAX_CHUNK_ELEMENTS // cols)
+    for start in range(0, rows, chunk_rows):
+        exponents = scales[start : start + chunk_rows].int() - 127
+        exponents = exponents.repeat_interleave(32, dim=1)[:, :cols]
+        decoded = torch.ldexp(codes[start : start + chunk_rows].float(), exponents)
+        weight[start : start + chunk_rows].copy_(decoded.bfloat16())
+        del exponents, decoded
+    if not torch.isfinite(weight).all():
+        raise ValueError("MXFP8 weights are not representable in BF16")
     return weight
 
 
@@ -123,9 +169,16 @@ def quantize_attention_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch
 class _AttentionPair:
     """Hold at most one converted projection until its scale is consumed."""
 
-    def __init__(self, source: torch.Tensor | _TensorSlice, device: torch.device) -> None:
+    def __init__(
+        self,
+        source: torch.Tensor | _TensorSlice,
+        device: torch.device,
+        mxfp8_scale: torch.Tensor | _TensorSlice | None = None,
+    ) -> None:
         self.source = source
         self.device = device
+        # E8M0 1x32 scales of an MXFP8 source; None for a BF16 source.
+        self.mxfp8_scale = mxfp8_scale
         self.shape = (
             tuple(source.shape) if isinstance(source, torch.Tensor) else tuple(source.get_shape())
         )
@@ -135,7 +188,12 @@ class _AttentionPair:
     def materialize(self) -> None:
         if self.scales is None:
             source = self.source if isinstance(self.source, torch.Tensor) else self.source[:]
-            codes, scales = quantize_attention_weight(source.to(self.device))
+            source = source.to(self.device)
+            if self.mxfp8_scale is not None:
+                scale = self.mxfp8_scale
+                scale = scale if isinstance(scale, torch.Tensor) else scale[:]
+                source = dequantize_mxfp8_weight(source, scale.to(self.device))
+            codes, scales = quantize_attention_weight(source)
             self.codes, self.scales = codes.cpu(), scales.cpu()
 
 
@@ -224,6 +282,13 @@ class K31LoadQuantization:
         enabled = os.environ.get(_SWITCH, "0")
         if enabled not in ("0", "1"):
             raise ValueError(f"{_SWITCH} must be 0 or 1, got {enabled!r}")
+        requant = os.environ.get(_REQUANT_SWITCH, "0")
+        if requant not in ("0", "1"):
+            raise ValueError(f"{_REQUANT_SWITCH} must be 0 or 1, got {requant!r}")
+        if requant == "1":
+            if enabled == "1":
+                raise ValueError(f"{_SWITCH} and {_REQUANT_SWITCH} are mutually exclusive")
+            return K31AttentionRequant.configure_requant(config)
         if enabled == "0":
             logger.info(f"{_SWITCH}=0: using native K3.1 checkpoint precision")
             return None
@@ -314,6 +379,100 @@ class K31LoadQuantization:
             if key + "_scale" in adapted or key + "_scale_inv" in adapted:
                 raise ValueError(f"K3.1 load conversion expects unquantized attention: {key}")
             pair = _AttentionPair(adapted[key], device)
+            adapted[key] = _AttentionValue(pair)
+            adapted[key + "_scale"] = _AttentionValue(pair, scale=True)
+        result = ConsumableWeightsDict(adapted)
+        checkpoint_dir = getattr(weights, "checkpoint_dir", None)
+        if checkpoint_dir is not None:
+            result.checkpoint_dir = checkpoint_dir
+        result.checkpoint_prefix = getattr(weights, "checkpoint_prefix", "")
+        return result
+
+
+class K31AttentionRequant(K31LoadQuantization):
+    """Serve native NVFP4 experts with block-scaled FP8 attention (``TLLM_K31_REQUANT_ATTN_FP8=1``).
+
+    nvidia/Kimi-K3.1-Pro-NVFP4 stores KDA projections as MXFP8 (E4M3 + E8M0 1x32), MLA
+    projections as BF16 and shared experts as MXFP8. The K3 attention runtime takes
+    FP8_BLOCK_SCALES (128x128, weight-only), so every KDA and MLA projection is requantized
+    at load (MXFP8 is decoded exactly first) and declared the way nvidia/Kimi-K3-NVFP4
+    declares it. Shared experts are declared unquantized; the trunk loader decodes them.
+    """
+
+    @classmethod
+    def configure_requant(cls, config: ModelConfig) -> K31AttentionRequant | None:
+        cfg = config.pretrained_config
+        if cfg.model_type != "kimi_k31":
+            raise ValueError(f"{_REQUANT_SWITCH} requires a K3.1 composite checkpoint")
+        text = cfg.text_config
+        from .modeling_kimi_linear import KimiK3MoERuntime
+
+        expert_layers = [
+            i
+            for i in range(text.num_hidden_layers)
+            if i >= text.first_k_dense_replace and i % text.moe_layer_freq == 0
+        ]
+        routed = [KimiK3MoERuntime._resolve_routed_quant_config(config, i) for i in expert_layers]
+        if not routed or any(q.quant_algo != QuantAlgo.NVFP4 for q in routed):
+            raise ValueError(f"{_REQUANT_SWITCH} requires a native NVFP4 routed-expert checkpoint")
+        declarations = dict(config.quant_config_dict or {})
+        attention_algos = {q.quant_algo for n, q in declarations.items() if ".self_attn." in n}
+        if attention_algos == {QuantAlgo.FP8_BLOCK_SCALES}:
+            logger.info(f"{_REQUANT_SWITCH}=1: attention is already FP8 block-scaled; no-op")
+            return None
+        if not attention_algos <= {QuantAlgo.MXFP8}:
+            raise ValueError(
+                f"{_REQUANT_SWITCH} expects MXFP8 or unquantized attention, got {attention_algos}"
+            )
+        prefixes = {
+            m.group(1) for n in declarations if (m := re.match(r"(.*?)layers\.\d+\.", n))
+        }
+        kv_cache_quant_algo = routed[0].kv_cache_quant_algo
+        declarations = {n: q for n, q in declarations.items() if q.quant_algo != QuantAlgo.MXFP8}
+        attention_keys = set()
+        kda_layers = set(text.linear_attn_config["kda_layers"])
+        for layer in range(text.num_hidden_layers):
+            is_kda = layer + 1 in kda_layers
+            for name in _KDA_FP8_DECLARATIONS if is_kda else _MLA_FP8_DECLARATIONS:
+                for prefix in prefixes:
+                    declarations[f"{prefix}layers.{layer}.self_attn.{name}"] = QuantConfig(
+                        quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+                        group_size=None,
+                        kv_cache_quant_algo=kv_cache_quant_algo,
+                    )
+            for projection in _KDA_PROJECTIONS if is_kda else _MLA_PROJECTIONS:
+                attention_keys.add(f"model.layers.{layer}.self_attn.{projection}.weight")
+        excludes = [
+            p for p in config.quant_config.exclude_modules or [] if p not in _REQUANT_EXCLUDES_DROP
+        ]
+        excludes += [p for p in _REQUANT_EXCLUDES_ADD if p not in excludes]
+        quant = config.quant_config.model_copy(update={"exclude_modules": excludes})
+        quant.__dict__.pop("quant_mode", None)
+        quant.__dict__.pop("layer_quant_mode", None)
+        frozen = config._frozen
+        config._frozen = False
+        config.quant_config = quant
+        config.quant_config_dict = declarations
+        config._frozen = frozen
+        logger.info(
+            f"{_REQUANT_SWITCH}=1: requantizing {len(attention_keys)} attention projections to "
+            "FP8 128x128 weight-only; routed experts stay NVFP4, shared experts BF16"
+        )
+        return cls(attention_keys)
+
+    def prepare_weights(self, llm: KimiLinearForCausalLM, weights) -> ConsumableWeightsDict:
+        """Replace attention projections with lazy FP8 codes and 128x128 block scales."""
+        adapted = dict(weights.items())
+        prefix = "language_model." if any(k.startswith("language_model.") for k in adapted) else ""
+        device = next(llm.parameters()).device
+        for name in self.attention_keys:
+            key = prefix + name
+            if key not in adapted:
+                raise KeyError(f"{_REQUANT_SWITCH} is missing attention projection {key}")
+            if key + "_scale_inv" in adapted:
+                raise ValueError(f"{_REQUANT_SWITCH} expects MXFP8 or BF16 attention: {key}")
+            mxfp8_scale = adapted.pop(key + "_scale", None)
+            pair = _AttentionPair(adapted[key], device, mxfp8_scale=mxfp8_scale)
             adapted[key] = _AttentionValue(pair)
             adapted[key + "_scale"] = _AttentionValue(pair, scale=True)
         result = ConsumableWeightsDict(adapted)

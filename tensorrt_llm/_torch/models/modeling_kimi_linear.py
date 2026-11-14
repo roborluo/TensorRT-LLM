@@ -5702,12 +5702,13 @@ def _fp8_block_scale_key(weight_key: str) -> str:
     return weight_key + _FP8_BLOCK_SCALE_SUFFIX
 
 
-def _checkpoint_fp8_pair(ckpt_key: str, src: torch.Tensor, weights):
+def _checkpoint_fp8_pair(ckpt_key: str, src: torch.Tensor, weights, allow_mxfp8: bool = False):
     """``(fp8 weight, fp32 128x128 block scale)`` if this tensor is FP8_PB_WO.
 
     ``None`` for an ordinary (BF16) checkpoint tensor. Raises when an FP8
     tensor has no companion scale rather than letting the caller fall through
-    to a cast that would silently drop it.
+    to a cast that would silently drop it. An MXFP8 tensor (uint8 E8M0 1x32
+    scale) is returned with its raw scale when ``allow_mxfp8``, else rejected.
     """
     if src.dtype != torch.float8_e4m3fn:
         return None
@@ -5719,7 +5720,15 @@ def _checkpoint_fp8_pair(ckpt_key: str, src: torch.Tensor, weights):
             f"Kimi K3: {ckpt_key} is FP8 E4M3 but has no {scale_key} or {scale_key}_inv; refusing "
             "to load it as if it were unquantized."
         )
-    scale = _materialize(weights[scale_key]).float()
+    scale = _materialize(weights[scale_key])
+    if scale.dtype == torch.uint8:
+        if allow_mxfp8:
+            return src, scale
+        raise ValueError(
+            f"Kimi K3: {ckpt_key} is MXFP8 (E8M0 1x32 scales), not 128x128 block-scaled FP8; "
+            "set TLLM_K31_REQUANT_ATTN_FP8=1 to requantize it at load."
+        )
+    scale = scale.float()
     # The checkpoint stores the block scale 4-D as
     # [ceil(N/128), 1, ceil(K/128), 1]. Normalize here, once, so every
     # consumer sees the plain 2-D [n_blocks_m, n_blocks_k] that both the
@@ -5738,10 +5747,14 @@ def _dequantize_fp8_block_scaled(ckpt_key: str, src: torch.Tensor, weights) -> t
     excluded projection or another unquantized trunk parameter whose source
     tensor is quantized; casting the codes alone would discard its scales.
     """
-    pair = _checkpoint_fp8_pair(ckpt_key, src, weights)
+    pair = _checkpoint_fp8_pair(ckpt_key, src, weights, allow_mxfp8=True)
     if pair is None:
         return src
     src, scale = pair
+    if scale.dtype == torch.uint8:
+        from .kimi_k31_load_quantization import dequantize_mxfp8_weight
+
+        return dequantize_mxfp8_weight(src, scale.to(src.device))
     out = src.to(torch.float32)
     if scale.numel() == 1:
         return (out * scale.reshape(())).to(torch.bfloat16)
